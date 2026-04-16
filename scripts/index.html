@@ -6,7 +6,8 @@
 <body>
     <script>
         /**
-         * Search using DuckDuckGo Instant Answer API with Wikipedia fallback.
+         * Fetches REAL DuckDuckGo search results by scraping the HTML version.
+         * Uses a CORS proxy (allorigins.win) to bypass WebView restrictions.
          */
         window['ai_edge_gallery_get_result'] = async (data) => {
             try {
@@ -17,88 +18,82 @@
                     return JSON.stringify({ error: "Missing 'query' parameter." });
                 }
 
-                // --- Attempt 1: DuckDuckGo Instant Answer API (via CORS proxy) ---
-                try {
-                    const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
-                    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(ddgUrl)}`;
+                // DuckDuckGo HTML endpoint (returns real search results as HTML)
+                const ddgHtmlUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=wt-wt`;
 
-                    const ddgResponse = await fetch(proxyUrl);
-                    if (ddgResponse.ok) {
-                        const proxyData = await ddgResponse.json();
-                        const json = JSON.parse(proxyData.contents);
+                // CORS proxy to allow WebView fetch
+                const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(ddgHtmlUrl)}`;
 
-                        if (json.AbstractText && json.AbstractText.length > 20) {
-                            return JSON.stringify({
-                                result: `📖 ${json.AbstractText}\n\n🔗 Source: ${json.AbstractSource || 'DuckDuckGo'} — ${json.AbstractURL || ''}`
-                            });
-                        }
+                const response = await fetch(proxyUrl);
 
-                        if (json.Answer) {
-                            return JSON.stringify({
-                                result: `✅ ${json.Answer}`
-                            });
-                        }
-
-                        // Try related topics
-                        if (json.RelatedTopics && json.RelatedTopics.length > 0) {
-                            const topics = json.RelatedTopics
-                                .slice(0, 4)
-                                .filter(t => t.Text && t.Text.length > 10)
-                                .map(t => `• ${t.Text}`)
-                                .join('\n');
-                            if (topics) {
-                                return JSON.stringify({
-                                    result: `🔍 DuckDuckGo results for "${query}":\n\n${topics}`
-                                });
-                            }
-                        }
-                    }
-                } catch (ddgError) {
-                    console.warn("DuckDuckGo failed, trying Wikipedia...", ddgError.message);
+                if (!response.ok) {
+                    throw new Error(`Proxy error: ${response.status}`);
                 }
 
-                // --- Attempt 2: Wikipedia Search API (native CORS support) ---
-                const wikiSearchUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=3&format=json&origin=*`;
-                const wikiResponse = await fetch(wikiSearchUrl);
+                const proxyData = await response.json();
+                const htmlContent = proxyData.contents;
 
-                if (wikiResponse.ok) {
-                    const wikiData = await wikiResponse.json();
-                    const results = wikiData.query?.search;
+                if (!htmlContent) {
+                    throw new Error("Empty proxy response.");
+                }
 
-                    if (results && results.length > 0) {
-                        // Get the intro of the top result
-                        const topTitle = results[0].title;
-                        const introUrl = `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=true&explaintext=true&titles=${encodeURIComponent(topTitle)}&format=json&origin=*`;
-                        const introResponse = await fetch(introUrl);
+                // Parse the returned HTML
+                const parser = new DOMParser();
+                const doc = parser.parseFromString(htmlContent, 'text/html');
 
-                        if (introResponse.ok) {
-                            const introData = await introResponse.json();
-                            const pages = introData.query?.pages;
-                            const page = pages ? Object.values(pages)[0] : null;
-                            const extract = page?.extract;
+                const results = [];
 
-                            if (extract) {
-                                // Trim to first 600 chars
-                                const trimmed = extract.length > 600 ? extract.substring(0, 600) + '...' : extract;
-                                return JSON.stringify({
-                                    result: `📚 Wikipedia: ${topTitle}\n\n${trimmed}\n\n🔗 https://en.wikipedia.org/wiki/${encodeURIComponent(topTitle)}`
-                                });
-                            }
-                        }
+                // Primary selectors used in DuckDuckGo HTML layout
+                const resultElements = doc.querySelectorAll('.result');
 
-                        // Fallback: just return search snippet
-                        const snippets = results
-                            .map(r => `• ${r.title}: ${r.snippet.replace(/<[^>]+>/g, '')}`)
-                            .join('\n\n');
-                        return JSON.stringify({
-                            result: `🔍 Wikipedia results for "${query}":\n\n${snippets}`
-                        });
+                for (const el of resultElements) {
+                    if (results.length >= 5) break;
+
+                    const titleEl = el.querySelector('.result__a');
+                    const snippetEl = el.querySelector('.result__snippet');
+                    const urlEl = el.querySelector('.result__url');
+
+                    if (!titleEl) continue;
+
+                    const title = titleEl.textContent?.trim() || '';
+                    const snippet = snippetEl?.textContent?.trim() || '';
+                    const url = urlEl?.textContent?.trim() || '';
+
+                    if (title.length > 2) {
+                        results.push({ title, snippet, url });
                     }
                 }
 
-                // --- No results from any source ---
+                // Fallback: try alternative selectors if primary failed
+                if (results.length === 0) {
+                    const altLinks = doc.querySelectorAll('a.result__a, h2 a, .results_links a');
+                    for (const link of altLinks) {
+                        if (results.length >= 5) break;
+                        const title = link.textContent?.trim() || '';
+                        const url = link.getAttribute('href') || '';
+                        if (title.length > 3 && !title.includes('DuckDuckGo')) {
+                            results.push({ title, snippet: '', url });
+                        }
+                    }
+                }
+
+                if (results.length === 0) {
+                    return JSON.stringify({
+                        result: `❌ No DuckDuckGo results found for: "${query}". Try rephrasing your query.`
+                    });
+                }
+
+                // Format results in a readable way for the LLM
+                const formatted = results
+                    .map((r, i) => [
+                        `${i + 1}. ${r.title}`,
+                        r.snippet ? `   ${r.snippet}` : '',
+                        r.url ? `   🔗 ${r.url}` : ''
+                    ].filter(Boolean).join('\n'))
+                    .join('\n\n');
+
                 return JSON.stringify({
-                    result: `❌ No results found for "${query}". Please try a different or more specific query.`
+                    result: `🦆 DuckDuckGo — Top results for: "${query}"\n\n${formatted}`
                 });
 
             } catch (error) {
