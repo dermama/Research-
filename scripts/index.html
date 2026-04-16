@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+</head>
+<body>
+    <script>
+        /**
+         * AI Edge Gallery Skill Entry Point
+         * This function is called by the app when the LLM invokes the skill.
+         * @param {string} data - Stringified JSON containing the parameters from the LLM.
+         * @returns {string} - Stringified JSON containing either 'result' or 'error'.
+         */
+        window['ai_edge_gallery_get_result'] = async (data) => {
+            try {
+                const parsedData = JSON.parse(data);
+                const query = parsedData.query;
+
+                if (!query) {
+                    return JSON.stringify({ error: "Missing 'query' parameter." });
+                }
+
+                // Call DuckDuckGo Instant Answer API
+                const apiUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+                
+                const response = await fetch(apiUrl);
+                if (!response.ok) {
+                    throw new Error(`DuckDuckGo API returned status ${response.status}`);
+                }
+
+                const json = await response.json();
+
+                let resultStr = "";
+                
+                if (json.AbstractText) {
+                    resultStr = `Info: ${json.AbstractText}\nSource: ${json.AbstractSource || 'DuckDuckGo'}`;
+                } else if (json.Answer) {
+                    resultStr = `Answer: ${json.Answer}`;
+                } else if (json.RelatedTopics && json.RelatedTopics.length > 0) {
+                    // Extract text from related topics if no direct abstract exists
+                    const topics = json.RelatedTopics
+                        .slice(0, 3)
+                        .filter(t => t.Text)
+                        .map(t => `- ${t.Text}`)
+                        .join("\n");
+                    
+                    if (topics) {
+                        resultStr = `Related results:\n${topics}`;
+                    } else {
+                        resultStr = "No direct answer found. Please try a more specific query.";
+                    }
+                } else {
+                    resultStr = "Sorry, no information was found for that query.";
+                }
+
+                return JSON.stringify({
+                    result: resultStr
+                });
+
+            } catch (error) {
+                console.error("Skill Error:", error);
+                return JSON.stringify({
+                    error: `Search failed: ${error.message}`
+                });
+            }
+        };
+    </script>
+</body>
+</html>
