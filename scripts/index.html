@@ -6,10 +6,7 @@
 <body>
     <script>
         /**
-         * AI Edge Gallery Skill Entry Point
-         * This function is called by the app when the LLM invokes the skill.
-         * @param {string} data - Stringified JSON containing the parameters from the LLM.
-         * @returns {string} - Stringified JSON containing either 'result' or 'error'.
+         * Search using DuckDuckGo Instant Answer API with Wikipedia fallback.
          */
         window['ai_edge_gallery_get_result'] = async (data) => {
             try {
@@ -20,41 +17,88 @@
                     return JSON.stringify({ error: "Missing 'query' parameter." });
                 }
 
-                // Call DuckDuckGo Instant Answer API
-                const apiUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
-                
-                const response = await fetch(apiUrl);
-                if (!response.ok) {
-                    throw new Error(`DuckDuckGo API returned status ${response.status}`);
-                }
+                // --- Attempt 1: DuckDuckGo Instant Answer API (via CORS proxy) ---
+                try {
+                    const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+                    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(ddgUrl)}`;
 
-                const json = await response.json();
+                    const ddgResponse = await fetch(proxyUrl);
+                    if (ddgResponse.ok) {
+                        const proxyData = await ddgResponse.json();
+                        const json = JSON.parse(proxyData.contents);
 
-                let resultStr = "";
-                
-                if (json.AbstractText) {
-                    resultStr = `Info: ${json.AbstractText}\nSource: ${json.AbstractSource || 'DuckDuckGo'}`;
-                } else if (json.Answer) {
-                    resultStr = `Answer: ${json.Answer}`;
-                } else if (json.RelatedTopics && json.RelatedTopics.length > 0) {
-                    // Extract text from related topics if no direct abstract exists
-                    const topics = json.RelatedTopics
-                        .slice(0, 3)
-                        .filter(t => t.Text)
-                        .map(t => `- ${t.Text}`)
-                        .join("\n");
-                    
-                    if (topics) {
-                        resultStr = `Related results:\n${topics}`;
-                    } else {
-                        resultStr = "No direct answer found. Please try a more specific query.";
+                        if (json.AbstractText && json.AbstractText.length > 20) {
+                            return JSON.stringify({
+                                result: `📖 ${json.AbstractText}\n\n🔗 Source: ${json.AbstractSource || 'DuckDuckGo'} — ${json.AbstractURL || ''}`
+                            });
+                        }
+
+                        if (json.Answer) {
+                            return JSON.stringify({
+                                result: `✅ ${json.Answer}`
+                            });
+                        }
+
+                        // Try related topics
+                        if (json.RelatedTopics && json.RelatedTopics.length > 0) {
+                            const topics = json.RelatedTopics
+                                .slice(0, 4)
+                                .filter(t => t.Text && t.Text.length > 10)
+                                .map(t => `• ${t.Text}`)
+                                .join('\n');
+                            if (topics) {
+                                return JSON.stringify({
+                                    result: `🔍 DuckDuckGo results for "${query}":\n\n${topics}`
+                                });
+                            }
+                        }
                     }
-                } else {
-                    resultStr = "Sorry, no information was found for that query.";
+                } catch (ddgError) {
+                    console.warn("DuckDuckGo failed, trying Wikipedia...", ddgError.message);
                 }
 
+                // --- Attempt 2: Wikipedia Search API (native CORS support) ---
+                const wikiSearchUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=3&format=json&origin=*`;
+                const wikiResponse = await fetch(wikiSearchUrl);
+
+                if (wikiResponse.ok) {
+                    const wikiData = await wikiResponse.json();
+                    const results = wikiData.query?.search;
+
+                    if (results && results.length > 0) {
+                        // Get the intro of the top result
+                        const topTitle = results[0].title;
+                        const introUrl = `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=true&explaintext=true&titles=${encodeURIComponent(topTitle)}&format=json&origin=*`;
+                        const introResponse = await fetch(introUrl);
+
+                        if (introResponse.ok) {
+                            const introData = await introResponse.json();
+                            const pages = introData.query?.pages;
+                            const page = pages ? Object.values(pages)[0] : null;
+                            const extract = page?.extract;
+
+                            if (extract) {
+                                // Trim to first 600 chars
+                                const trimmed = extract.length > 600 ? extract.substring(0, 600) + '...' : extract;
+                                return JSON.stringify({
+                                    result: `📚 Wikipedia: ${topTitle}\n\n${trimmed}\n\n🔗 https://en.wikipedia.org/wiki/${encodeURIComponent(topTitle)}`
+                                });
+                            }
+                        }
+
+                        // Fallback: just return search snippet
+                        const snippets = results
+                            .map(r => `• ${r.title}: ${r.snippet.replace(/<[^>]+>/g, '')}`)
+                            .join('\n\n');
+                        return JSON.stringify({
+                            result: `🔍 Wikipedia results for "${query}":\n\n${snippets}`
+                        });
+                    }
+                }
+
+                // --- No results from any source ---
                 return JSON.stringify({
-                    result: resultStr
+                    result: `❌ No results found for "${query}". Please try a different or more specific query.`
                 });
 
             } catch (error) {
